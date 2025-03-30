@@ -1316,6 +1316,8 @@ enum SpannedLayerExprs {
 pub struct ParserContext {
     is_within_defvirtualkeys: bool,
     trans_forbidden_reason: Option<&'static str>,
+    current_layer_name: RefCell<Option<String>>,
+    current_defsrc_position: RefCell<Option<OsCode>>,
 }
 
 #[derive(Debug)]
@@ -1896,6 +1898,15 @@ fn parse_action_list(ac: &[SExpr], s: &ParserState) -> Result<&'static KanataAct
         CLIPBOARD_SAVE_SET => parse_clipboard_save_set(&ac[1..], s),
         CLIPBOARD_SAVE_CMD_SET => parse_cmd(&ac[1..], s, CmdType::ClipboardSaveSet),
         CLIPBOARD_SAVE_SWAP => parse_clipboard_save_swap(&ac[1..], s),
+        // TODO: add (delegate-to-layer $layerName)
+        // - action returned is just transparent or no-op,
+        //   but it will fill in the state `s`.
+        // - After layer actions are filled in, add a step to read state and hydrate according to
+        //   state updated
+        // - Need to read context; must be in a layer and have a defsrc item
+        // - Test and document cyclical behaviour: expect no-op or transparent depending on what is
+        //   decided. Probably no-op; it's more explicit that what the user did is
+        //   unsupported/erroneous.
         _ => unreachable!(),
     }
 }
@@ -3388,18 +3399,34 @@ fn parse_layers(
         bail!("Maximum number of layers ({}) exceeded.", MAX_LAYERS);
     }
     let mut defsrc_layer = s.defsrc_layer;
-    for (layer_level, layer) in s.layer_exprs.iter().enumerate() {
+    for (layer_index, layer) in s.layer_exprs.iter().enumerate() {
         match layer {
             // The skip is done to skip the `deflayer` and layer name tokens.
             LayerExprs::DefsrcMapping(layer) => {
+                *s.pctx.current_layer_name.borrow_mut() = Some(
+                    layer[1]
+                        .atom(s.vars())
+                        .expect("layer name is an atom")
+                        .into(),
+                );
                 // Parse actions in the layer and place them appropriately according
                 // to defsrc mapping order.
                 for (i, ac) in layer.iter().skip(2).enumerate() {
+                    *s.pctx.current_defsrc_position.borrow_mut() =
+                        Some((s.mapping_order[i] as u16).into());
                     let ac = parse_action(ac, s)?;
-                    layers_cfg[layer_level][0][s.mapping_order[i]] = *ac;
+                    layers_cfg[layer_index][0][s.mapping_order[i]] = *ac;
+                    *s.pctx.current_defsrc_position.borrow_mut() = None;
                 }
+                *s.pctx.current_layer_name.borrow_mut() = None;
             }
             LayerExprs::CustomMapping(layer) => {
+                *s.pctx.current_layer_name.borrow_mut() = Some(
+                    layer[1]
+                        .atom(s.vars())
+                        .expect("layer name is an atom")
+                        .into(),
+                );
                 // Parse actions as input output pairs
                 let mut pairs = layer[2..].chunks_exact(2);
                 let mut layer_mapped_keys = HashSet::default();
@@ -3410,7 +3437,18 @@ fn parse_layers(
                     let input = &pair[0];
                     let action = &pair[1];
 
+                    // This is only a "real" value for normal key names and not any of the
+                    // underscore variants with special meaning:
+                    //     _
+                    //     __
+                    //     ___
+                    // What should be done about these variants?
+                    // Could disallow them. But there *is* a known reasonable implementation for
+                    // these which is to just do it for every key.
+                    *s.pctx.current_defsrc_position.borrow_mut() = None; // TODO: wrong
                     let action = parse_action(action, s)?;
+                    *s.pctx.current_defsrc_position.borrow_mut() = None;
+                    // Question... disallow or allow
                     if input.atom(s.vars()).is_some_and(|x| x == "_") {
                         if defsrc_anykey_used {
                             bail_expr!(input, "must have only one use of _ within a layer")
@@ -3419,8 +3457,8 @@ fn parse_layers(
                             bail_expr!(input, "must either use _ or ___ within a layer, not both")
                         }
                         for i in 0..s.mapping_order.len() {
-                            if layers_cfg[layer_level][0][s.mapping_order[i]] == DEFAULT_ACTION {
-                                layers_cfg[layer_level][0][s.mapping_order[i]] = *action;
+                            if layers_cfg[layer_index][0][s.mapping_order[i]] == DEFAULT_ACTION {
+                                layers_cfg[layer_index][0][s.mapping_order[i]] = *action;
                             }
                         }
                         defsrc_anykey_used = true;
@@ -3438,10 +3476,10 @@ fn parse_layers(
                             bail_expr!(input, "must either use __ or ___ within a layer, not both")
                         }
                         for i in 0..layers_cfg[0][0].len() {
-                            if layers_cfg[layer_level][0][i] == DEFAULT_ACTION
+                            if layers_cfg[layer_index][0][i] == DEFAULT_ACTION
                                 && !s.mapping_order.contains(&i)
                             {
-                                layers_cfg[layer_level][0][i] = *action;
+                                layers_cfg[layer_index][0][i] = *action;
                             }
                         }
                         unmapped_anykey_used = true;
@@ -3462,8 +3500,8 @@ fn parse_layers(
                             );
                         }
                         for i in 0..layers_cfg[0][0].len() {
-                            if layers_cfg[layer_level][0][i] == DEFAULT_ACTION {
-                                layers_cfg[layer_level][0][i] = *action;
+                            if layers_cfg[layer_index][0][i] == DEFAULT_ACTION {
+                                layers_cfg[layer_index][0][i] = *action;
                             }
                         }
                         both_anykey_used = true;
@@ -3476,16 +3514,17 @@ fn parse_layers(
                         if !layer_mapped_keys.insert(input_key) {
                             bail_expr!(input, "input key must not be repeated within a layer")
                         }
-                        layers_cfg[layer_level][0][usize::from(input_key)] = *action;
+                        layers_cfg[layer_index][0][usize::from(input_key)] = *action;
                     }
                 }
                 let rem = pairs.remainder();
                 if !rem.is_empty() {
                     bail_expr!(&rem[0], "input must by followed by an action");
                 }
+                *s.pctx.current_layer_name.borrow_mut() = None;
             }
         }
-        for (osc, layer_action) in layers_cfg[layer_level][0].iter_mut().enumerate() {
+        for (osc, layer_action) in layers_cfg[layer_index][0].iter_mut().enumerate() {
             if *layer_action == DEFAULT_ACTION {
                 *layer_action = match s.block_unmapped_keys && !is_a_button(osc as u16) {
                     true => Action::NoOp,
@@ -3497,13 +3536,13 @@ fn parse_layers(
         // Set fake keys on every layer.
         for (y, action) in s.virtual_keys.values() {
             let (x, y) = get_fake_key_coords(*y);
-            layers_cfg[layer_level][x as usize][y as usize] = **action;
+            layers_cfg[layer_index][x as usize][y as usize] = **action;
         }
 
         // If the user has configured delegation to the first (default) layer for transparent keys,
         // (as opposed to delegation to defsrc), replace the defsrc actions with the actions from
         // the first layer.
-        if layer_level == 0 && s.delegate_to_first_layer {
+        if layer_index == 0 && s.delegate_to_first_layer {
             for (defsrc_ac, default_layer_ac) in defsrc_layer.iter_mut().zip(layers_cfg[0][0]) {
                 if default_layer_ac != Action::Trans {
                     *defsrc_ac = default_layer_ac;
@@ -3513,7 +3552,7 @@ fn parse_layers(
 
         // Very last thing - ensure index 0 is always no-op. This shouldn't have any way to be
         // physically activated. This enable other code to rely on there always being a no-op key.
-        layers_cfg[layer_level][0][0] = Action::NoOp;
+        layers_cfg[layer_index][0][0] = Action::NoOp;
     }
     Ok(layers_cfg)
 }
