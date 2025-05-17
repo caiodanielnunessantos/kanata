@@ -139,7 +139,7 @@ gui = ["win_manifest","kanata-parser/gui",
 zippychord = ["kanata-parser/zippychord"]
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = "fat"
 panic = "abort"
 codegen-units = 1
